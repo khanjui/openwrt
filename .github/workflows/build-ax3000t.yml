@@ -1,17 +1,18 @@
 # Put this in a GitHub repo of yours as .github/workflows/build-ax3000t.yml,
 # then run it from the Actions tab ("Run workflow").
 #
-# It clones openwrt/openwrt main, merges the chosen PR on top, builds the
-# device's default package set, and uploads the images as a workflow artifact.
+# It clones openwrt/openwrt main, merges the listed PRs on top (in order),
+# builds the device's package set, and uploads the images plus a
+# verification.txt as a workflow artifact.
 
-name: Build OpenWrt snapshot (AX3000T + PR)
+name: Build OpenWrt snapshot (AX3000T + PRs)
 
 on:
   workflow_dispatch:
     inputs:
-      pr:
-        description: "openwrt/openwrt PR number to merge onto main"
-        default: "25679"
+      prs:
+        description: "openwrt/openwrt PR numbers to merge onto main, in order (space or comma separated)"
+        default: "25679 25910 25780 25969"
       device:
         description: "Device profile (xiaomi_mi-router-ax3000t = stock layout; xiaomi_mi-router-ax3000t-ubootmod = ubootmod layout)"
         default: "xiaomi_mi-router-ax3000t"
@@ -21,7 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
-      PR: ${{ inputs.pr }}
+      PRS: ${{ inputs.prs }}
       DEVICE: ${{ inputs.device }}
     steps:
       - name: Free up disk space
@@ -41,14 +42,85 @@ jobs:
       - name: Clone openwrt main
         run: git clone https://github.com/openwrt/openwrt.git openwrt
 
-      - name: Merge the PR
+      # Merges each PR head in order. A PR can conflict with main (or with an
+      # earlier PR) in patch files of targets this build never uses, e.g.
+      # target/linux/airoha or ipq40xx. Those are resolved by keeping the
+      # version already in the tree and are listed in verification.txt.
+      # A conflict in anything that can affect this build stops the run.
+      - name: Merge the PRs
         working-directory: openwrt
         run: |
           git config user.name "ci"
           git config user.email "ci@example.invalid"
-          git fetch origin "refs/pull/${PR}/head"
-          git merge --no-edit FETCH_HEAD
-          git log --oneline -3
+          prs=$(echo "$PRS" | tr -s ' ,' '  ' | sed 's/^ //; s/ $//')
+          echo "UPSTREAM_SHA=$(git rev-parse origin/main)" >> "$GITHUB_ENV"
+          echo "ARTIFACT=openwrt-${DEVICE}-pr$(echo "$prs" | tr ' ' '-')" >> "$GITHUB_ENV"
+          : > ../pr-shas.txt
+          : > ../resolved-conflicts.txt
+          for n in $prs; do
+            git fetch origin "refs/pull/${n}/head"
+            sha=$(git rev-parse FETCH_HEAD)
+            echo "$n $sha" >> ../pr-shas.txt
+            echo "::group::Merge PR #${n} ($sha)"
+            if ! git merge --no-edit -m "Merge PR #${n} (${sha})" "$sha"; then
+              bad=""
+              for f in $(git diff --name-only --diff-filter=U); do
+                case "$f" in
+                  target/linux/generic/*|target/linux/mediatek/*) bad="$bad $f" ;;
+                  target/linux/*)
+                    if git checkout --ours -- "$f" 2>/dev/null; then git add -- "$f"; else git rm -q -f -- "$f"; fi
+                    echo "PR #${n}: $f" | tee -a ../resolved-conflicts.txt ;;
+                  *) bad="$bad $f" ;;
+                esac
+              done
+              if [ -n "$bad" ]; then
+                echo "::error::PR #${n} conflicts in files that matter for this build:$bad"
+                exit 1
+              fi
+              git commit --no-edit
+            fi
+            echo "::endgroup::"
+          done
+          git log --first-parent --oneline -n "$(( $(echo "$prs" | wc -w) + 1 ))"
+
+      # Proof #1 (before the build): every PR head is part of the tree being
+      # built, every file a PR adds exists, every file it deletes is gone.
+      - name: Verify the PRs are in the tree
+        working-directory: openwrt
+        run: |
+          relevant() {  # files of other targets may legitimately differ (see merge step)
+            case "$1" in
+              target/linux/generic/*|target/linux/mediatek/*) return 0 ;;
+              target/linux/*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
+          fail=0
+          {
+            echo "upstream main : $UPSTREAM_SHA"
+            echo "build HEAD    : $(git rev-parse HEAD)"
+            echo "version string: $(./scripts/getver.sh)"
+            if [ -s ../resolved-conflicts.txt ]; then
+              echo "conflicts resolved in files of other targets (kept the version already in the tree):"
+              sed 's/^/  /' ../resolved-conflicts.txt
+            fi
+          } | tee ../verification.txt
+          while read -r n sha; do
+            if ! git merge-base --is-ancestor "$sha" HEAD; then
+              echo "PR #$n head $sha is NOT in HEAD" | tee -a ../verification.txt; fail=1; continue
+            fi
+            base=$(git merge-base "$UPSTREAM_SHA" "$sha")
+            { echo; echo "== PR #$n  head $sha"; git log --oneline "$base..$sha" | sed 's/^/  commit /'; } | tee -a ../verification.txt
+            while read -r f; do
+              if [ -n "$f" ] && relevant "$f" && [ ! -e "$f" ]; then echo "  MISSING: $f" | tee -a ../verification.txt; fail=1; fi
+            done < <(git diff --name-only --diff-filter=A "$base" "$sha")
+            while read -r f; do
+              if [ -n "$f" ] && relevant "$f" && [ -e "$f" ]; then echo "  STILL PRESENT: $f" | tee -a ../verification.txt; fail=1; fi
+            done < <(git diff --name-only --diff-filter=D "$base" "$sha")
+            echo "  files added/deleted by the PR are as expected"
+          done < ../pr-shas.txt
+          if [ "$fail" = 0 ]; then echo "all PRs are in the tree: OK"; fi
+          exit "$fail"
 
       - name: Update feeds
         working-directory: openwrt
@@ -103,15 +175,60 @@ jobs:
         working-directory: openwrt
         run: make -j"$(($(nproc) + 1))" || make -j1 V=s
 
+      # Proof #2 (after the build): look inside the kernel and mac80211 sources
+      # that were actually compiled and confirm each PR's code is in them.
+      # Informational: a warning here never throws away a finished build.
+      - name: Verify the PRs' code is in the built sources
+        working-directory: openwrt
+        continue-on-error: true
+        run: |
+          prs=" $(echo "$PRS" | tr -s ' ,' '  ') "
+          has_pr() { case "$prs" in *" $1 "*) return 0 ;; esac; return 1; }
+          check() {  # $1 = path pattern under build_dir, $2 = text that must appear, $3 = label
+            f=$(find build_dir -type f -path "$1" 2>/dev/null | head -n1)
+            if [ -z "$f" ]; then echo "NOT LOCATED  $3"; return 0; fi
+            if grep -qF -- "$2" "$f"; then echo "FOUND        $3"; else echo "ABSENT       $3"; fi
+          }
+          K='*/linux-mediatek_filogic/linux-6.18*'
+          M='*/linux-mediatek_filogic/*backports-*'
+          out=$(
+            echo; echo "== PR code present in the sources that were actually built =="
+            if has_pr 25679; then
+              check "$K/include/linux/netdevice.h"                       'DEV_PATH_IEEE80211'           "#25679 kernel: DEV_PATH_IEEE80211 path type"
+              check "$K/net/netfilter/nf_flow_table_path.c"              'static int nft_dev_path_info' "#25679 kernel: flowtable bail-out (int-returning path discovery)"
+              check "$K/net/netfilter/nf_flow_table_path.c"              'DEV_PATH_IEEE80211'           "#25679 kernel: flowtable handles the Wi-Fi path"
+              check "$K/drivers/net/ethernet/mediatek/mtk_ppe_offload.c" 'dev_fill_forward_path(&ctx'   "#25679 kernel: MediaTek PPE offload uses the new API"
+              check "$M/net/mac80211/iface.c"                            'DEV_PATH_IEEE80211'           "#25679 mac80211: Wi-Fi forward path"
+            fi
+            if has_pr 25910; then
+              check "$K/include/net/gro.h"   'skb_gro_flist_skip_csum' "#25910 kernel: fraglist GRO checksum skip"
+              check "$K/net/core/skbuff.c"   'skb_flist_tcp_checksum'  "#25910 kernel: fraglist TCP checksum verify"
+            fi
+            if has_pr 25780; then
+              check "$K/net/ipv4/ipmr.c"           'skb_gso_validate_network_len(skb, mtu - encap)' "#25780 kernel: ipmr forwards GSO packets that fit the MTU"
+              check "$K/net/ipv4/ip_tunnel_core.c" 'SKB_GSO_TCP_FIXEDID_INNER'                      "#25780 kernel: TCP fixed-ID flag moved to inner header"
+              check "$K/net/core/skbuff.c"         'skb_cow_head(nskb, offset + tnl_hlen'           "#25780 kernel: skb_segment_list tunnel headroom"
+            fi
+            if has_pr 25969; then
+              check "$M/net/mac80211/tx.c" 'schedule_open' "#25969 mac80211: TXQ scheduling round kept"
+            fi
+          )
+          printf '%s\n' "$out" | tee -a ../verification.txt
+          { echo '```'; printf '%s\n' "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if printf '%s\n' "$out" | grep -qE '^(NOT LOCATED|ABSENT)'; then
+            echo "::warning::Some PR markers were not found in the built sources - see verification.txt"
+          fi
+
       - name: Collect images
         working-directory: openwrt
         run: |
           mkdir -p ../out
+          cp ../verification.txt ../out/
           cp bin/targets/mediatek/filogic/*"${DEVICE}"* ../out/
           cp bin/targets/mediatek/filogic/{sha256sums,config.buildinfo,version.buildinfo,profiles.json} ../out/ 2>/dev/null || true
           ls -lh ../out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: openwrt-${{ inputs.device }}-pr${{ inputs.pr }}
+          name: ${{ env.ARTIFACT }}
           path: out/
