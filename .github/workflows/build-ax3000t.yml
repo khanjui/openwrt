@@ -12,7 +12,7 @@ on:
     inputs:
       prs:
         description: "openwrt/openwrt PR numbers to merge onto main, in order (space or comma separated)"
-        default: "25679 25910 25780 25969"
+        default: "25910 25780 25969 26177"
       device:
         description: "Device profile (xiaomi_mi-router-ax3000t = stock layout; xiaomi_mi-router-ax3000t-ubootmod = ubootmod layout)"
         default: "xiaomi_mi-router-ax3000t"
